@@ -14,7 +14,7 @@
         "test": "vitest run --passWithNoTests"
     },
     "dependencies": {
-        "@akutishevsky/lunchmoney-mcp": "github:bm1549/lunchmoney-mcp#df910c7e6fd616eb55ba57c7d1e115e0f927ed64",
+        "@akutishevsky/lunchmoney-mcp": "github:georgebashi/lunchmoney-mcp#a12411ea4d45da721397b1d85d21202a0a5f5748",
         "@cloudflare/workers-oauth-provider": "0.8.3",
         "@modelcontextprotocol/server": "2.0.0",
         "agents": "0.22.0",

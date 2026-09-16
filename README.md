@@ -91,6 +91,28 @@ npx wrangler kv key list --binding OAUTH_KV
 npx wrangler kv key delete --binding OAUTH_KV "<grant key>"
 ```
 
+## The LunchMoney MCP dependency
+
+`@akutishevsky/lunchmoney-mcp` is pinned to a commit in
+[georgebashi/lunchmoney-mcp](https://github.com/georgebashi/lunchmoney-mcp),
+not to the npm release. That needs explaining, because it is a fork of a fork:
+
+- **Upstream** ([akutishevsky/lunchmoney-mcp](https://github.com/akutishevsky/lunchmoney-mcp))
+  publishes 3.0.0 to npm, but still builds against MCP SDK v1 and zod 3.
+- **`agents`** — which provides the `createMcpHandler` this worker mounts on
+  `/mcp` — peer-requires `@modelcontextprotocol/server` v2 and zod 4, and its
+  handler takes a v2 `McpServer`. The npm release is therefore not usable here.
+- **bm1549's fork** ported upstream to SDK v2 and added `runWithConfig`. Its
+  `upstream/sdk-v2` branch has that work rebased on upstream 3.0.0, but is
+  packaged for npm publication: `prepare` doesn't run `tsc` and `files` is
+  `["build"]`, so installing it straight from git yields no build output.
+- **This fork** is that branch plus the two `package.json` lines that make it
+  installable as a git dependency.
+
+To move it forward when upstream or bm1549 releases something new, rebase
+`v3-sdk-v2-installable` onto the new base, keep the packaging commit on top,
+and re-pin `package.json` to the resulting SHA.
+
 ## Local development
 
 ```sh
