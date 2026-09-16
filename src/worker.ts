@@ -1,138 +1,114 @@
+// Entry point: a personal remote MCP server for LunchMoney.
+//
+// The worker is its own OAuth authorization server, because that is the only
+// way Claude's custom-connector UI knows how to authenticate against a remote
+// MCP endpoint. It is *not* an identity provider: there is one user (you), one
+// LunchMoney token (a worker secret), and /authorize just checks that whoever
+// is approving the connection knows that token. See src/handlers/authorize.ts.
+
+import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
-import {
-    createOAuthWorker,
-    signResumeToken,
-    type BaseEnv,
-    type AppEnv,
-    type GoogleUserInfo,
-    type ResolveUserResult,
-    type McpApiHandler,
-} from "@bm1549/remote-mcp-cloudflare";
 import { createServer } from "@akutishevsky/lunchmoney-mcp/server";
 import { runWithConfig } from "@akutishevsky/lunchmoney-mcp/config";
 import packageJson from "../package.json" with { type: "json" };
-import { getUserToken } from "./storage.js";
-import { setupHandler } from "./handlers/setup.js";
+import { authorizeHandler } from "./handlers/authorize.js";
+import { checkClientMetadata } from "./register-policy.js";
+import type { AuthEnv } from "./env.js";
 
-interface WorkerEnv extends BaseEnv {
-    USER_TOKENS: KVNamespace;
-    REGISTER_LIMITER: RateLimit;
-}
-
-interface UserProps extends Record<string, unknown> {
-    sub: string;
-    email: string;
-}
+const API_ROUTE = "/mcp";
 
 /**
- * Per-request MCP server factory.
+ * The MCP endpoint. Only reached with a valid access token — the OAuth
+ * provider rejects anything else before this runs.
  *
- * Replaces the former `LunchMoneyMCP` Durable Object. Because one stateless
- * isolate serves every user, the LunchMoney token is bound with
- * `runWithConfig` for the duration of this request only — never through the
- * module-level `initializeConfig` singleton, which concurrent requests share.
+ * The LunchMoney token is bound with `runWithConfig` rather than the
+ * module-level `initializeConfig` singleton. It is a single-tenant worker so
+ * the two would behave the same today, but `initializeConfig` sets a
+ * process-wide fallback that a future second tenant would silently inherit;
+ * scoping it per request keeps that mistake impossible to make.
  */
-const lunchMoneySource = {
-    serve(path: string): McpApiHandler {
-        return {
-            async fetch(
-                request: Request,
-                env: never,
-                ctx: ExecutionContext,
-            ): Promise<Response> {
-                const workerEnv = env as unknown as WorkerEnv;
-
-                // Read directly off the ExecutionContext the OAuth provider
-                // populated — not from inside the factory, and not via any
-                // `agents` auth-context helper. This has to happen out here,
-                // before `handler(...)` is called, so the whole call
-                // (including whatever tool dispatch that one request
-                // triggers) can run inside a single `runWithConfig` scope.
-                const props = ctx.props as UserProps | undefined;
-                const sub = props?.sub;
-                if (!sub) {
-                    throw new Error("Missing sub in MCP auth context");
-                }
-
-                const stored = await getUserToken(workerEnv.USER_TOKENS, sub);
-                if (!stored) {
-                    // Shouldn't happen — resolveUser would have redirected
-                    // to /setup before we got here. If we did, the KV row
-                    // was deleted under an active grant.
-                    throw new Error(
-                        `No LunchMoney token stored for user ${sub}. Sign in again to re-onboard.`,
-                    );
-                }
-
-                const handler = createMcpHandler(
-                    () => createServer(packageJson.version),
-                    { route: path },
-                );
-
-                // The scope must cover the whole request, not just server
-                // construction — see the correction note above.
-                return runWithConfig(stored.token, () =>
-                    handler(request, env, ctx),
-                );
-            },
-        };
+const apiHandler = {
+    async fetch(
+        request: Request,
+        env: AuthEnv,
+        ctx: ExecutionContext,
+    ): Promise<Response> {
+        const token = env.LUNCHMONEY_API_TOKEN;
+        if (!token) {
+            throw new Error(
+                "LUNCHMONEY_API_TOKEN is not set. Run: wrangler secret put LUNCHMONEY_API_TOKEN",
+            );
+        }
+        const handler = createMcpHandler(
+            () => createServer(packageJson.version),
+            { route: API_ROUTE },
+        );
+        return runWithConfig(token, () =>
+            handler(request, env as never, ctx),
+        );
     },
 };
 
-export default createOAuthWorker(lunchMoneySource, {
-    userIdSource: "sub",
-    resolveUser: async (
-        userinfo: GoogleUserInfo,
-        env: AppEnv,
-        _request: Request,
-        oauthReqInfo?: unknown,
-    ): Promise<ResolveUserResult> => {
-        if (!userinfo.email_verified || !userinfo.email || !userinfo.sub) {
-            return { reject: "Email not verified by Google" };
+/** Everything that isn't the MCP endpoint or a provider-owned OAuth route. */
+const browserHandler = {
+    async fetch(request: Request, env: AuthEnv): Promise<Response> {
+        const url = new URL(request.url);
+        if (url.pathname === "/authorize") {
+            return authorizeHandler(request, env);
         }
-        const email = userinfo.email.toLowerCase();
-        const sub = userinfo.sub;
-
-        // Optional beta allowlist. Empty / unset => open signup.
-        const allowedRaw = ((env.ALLOWED_EMAILS as string | undefined) ?? "").trim();
-        if (allowedRaw) {
-            const allowed = allowedRaw
-                .split(",")
-                .map((s) => s.trim().toLowerCase())
-                .filter(Boolean);
-            if (!allowed.includes(email)) {
-                // Matches the package's default error string for parity. We
-                // accept the small information leak here; tightening this is
-                // a follow-up.
-                return { reject: `Forbidden: ${email} is not authorized` };
-            }
+        if (url.pathname === "/") {
+            return new Response(
+                `LunchMoney MCP server.\n\nAdd ${url.origin}${API_ROUTE} to Claude as a custom connector.\n`,
+                { headers: { "content-type": "text/plain; charset=utf-8" } },
+            );
         }
-
-        const stored = await getUserToken(
-            (env as unknown as WorkerEnv).USER_TOKENS,
-            sub,
-        );
-        if (stored) {
-            return { userId: sub, props: { sub, email } };
-        }
-
-        // First-time user: bounce to /setup to collect a LunchMoney token.
-        const resumeToken = await signResumeToken(env, {
-            oauthReqInfo,
-            sub,
-            email,
-        });
-        return { redirect: "/setup", resumeToken };
+        return new Response("Not found", { status: 404 });
     },
-    registerPolicy: {
-        requirePkce: true,
-        allowedRedirectSchemes: ["https", "http-localhost"],
-        rejectIpHosts: true,
-        maxRedirectUris: 5,
-    },
-    routes: {
-        "/setup": setupHandler,
-        // "/settings": stubbed for v1 — see README. Token rotation requires
-        // operator-side KV delete in this release.
+};
+
+const provider = new OAuthProvider<AuthEnv>({
+    apiRoute: API_ROUTE,
+    apiHandler,
+    defaultHandler: browserHandler,
+    authorizeEndpoint: "/authorize",
+    tokenEndpoint: "/token",
+    clientRegistrationEndpoint: "/register",
+    // OAuth 2.1: S256 only. `plain` offers no protection against a code
+    // interceptor, and every MCP client in practice supports S256.
+    allowPlainPKCE: false,
+    clientRegistrationCallback: ({ clientMetadata }) => {
+        const problem = checkClientMetadata(clientMetadata);
+        return problem ? { description: problem } : undefined;
     },
 });
+
+export default {
+    async fetch(
+        request: Request,
+        env: AuthEnv,
+        ctx: ExecutionContext,
+    ): Promise<Response> {
+        // Registration is necessarily unauthenticated, so throttle it per IP.
+        // Without this, anyone who finds the URL can mint KV entries forever.
+        if (
+            request.method === "POST" &&
+            new URL(request.url).pathname === "/register"
+        ) {
+            const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+            const { success } = await env.REGISTER_LIMITER.limit({
+                key: `register:${ip}`,
+            });
+            if (!success) {
+                return Response.json(
+                    {
+                        error: "invalid_client_metadata",
+                        error_description:
+                            "Too many registration attempts; try again shortly.",
+                    },
+                    { status: 429 },
+                );
+            }
+        }
+        return provider.fetch(request, env, ctx);
+    },
+} satisfies ExportedHandler<AuthEnv>;
