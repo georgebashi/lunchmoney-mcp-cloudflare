@@ -9,7 +9,7 @@
             // OAuth client registrations, grants and issued tokens.
             //   npx wrangler kv namespace create OAUTH_KV
             "binding": "OAUTH_KV",
-            "id": "REPLACE_WITH_OAUTH_KV_ID"
+            "id": "9162fd5adf3247038c9272a231744179"
         }
     ],
     "ratelimits": [
