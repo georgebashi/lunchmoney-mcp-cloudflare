@@ -3,7 +3,7 @@
     "version": "0.3.0",
     "private": true,
     "type": "module",
-    "description": "Cloudflare Worker that exposes the LunchMoney MCP server (akutishevsky/lunchmoney-mcp) as a remote MCP endpoint with Google OAuth.",
+    "description": "Cloudflare Worker that exposes the LunchMoney MCP server (akutishevsky/lunchmoney-mcp) as a personal remote MCP endpoint for Claude.",
     "scripts": {
         "setup": "bash setup.sh",
         "dev": "wrangler dev",
@@ -15,7 +15,7 @@
     },
     "dependencies": {
         "@akutishevsky/lunchmoney-mcp": "github:bm1549/lunchmoney-mcp#df910c7e6fd616eb55ba57c7d1e115e0f927ed64",
-        "@bm1549/remote-mcp-cloudflare": "0.3.0",
+        "@cloudflare/workers-oauth-provider": "0.8.3",
         "@modelcontextprotocol/server": "2.0.0",
         "agents": "0.22.0",
         "zod": "^4.6.1"

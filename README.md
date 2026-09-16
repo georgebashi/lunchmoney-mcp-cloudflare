@@ -1,88 +1,61 @@
 # lunchmoney-mcp-cloudflare
 
-Deploy [LunchMoney's MCP server](https://github.com/akutishevsky/lunchmoney-mcp) to Cloudflare so Claude (desktop or mobile) can use it as a custom connector. Sign-in is gated by Google, with an optional Gmail allowlist for beta deployments. Each end-user supplies their own LunchMoney API token on first connect — the operator deploying the worker does not need a LunchMoney token.
+Deploy [LunchMoney's MCP server](https://github.com/akutishevsky/lunchmoney-mcp) to a Cloudflare Worker so Claude (web, desktop or mobile) can use it as a custom connector.
+
+This is a **personal deployment**: one worker, one LunchMoney account, one API token. The token lives as a Cloudflare secret, and pasting that same token at the connector's sign-in page is how you approve a client. There is no identity provider, no user database and no accounts to manage.
 
 ## What you'll need
 
-**As the operator** (the person deploying):
-
 - A free [Cloudflare account](https://dash.cloudflare.com/sign-up)
-- A [Google Cloud account](https://console.cloud.google.com/) (to create the OAuth client all end-users authenticate against)
+- A [LunchMoney API token](https://my.lunchmoney.app/developers)
 - Node 22 or newer
-
-**As an end-user connecting from Claude:**
-
-- A Google account (one of the allowlisted Gmail addresses, if the operator configured an allowlist)
-- A [LunchMoney API token](https://my.lunchmoney.app/developers) — you'll paste this once at the `/setup` page on first connect
 
 ## Quick start
 
 ```sh
-git clone https://github.com/bm1549/lunchmoney-mcp-cloudflare.git
+git clone https://github.com/georgebashi/lunchmoney-mcp-cloudflare.git
 cd lunchmoney-mcp-cloudflare
 ./setup.sh
 ```
 
-The wizard walks you through everything below — KV namespaces, deploy, Google OAuth client, secrets, redeploy — and prints the final URL to paste into claude.ai.
+The wizard does everything below — KV namespace, deploy, secret — and prints the URL to paste into Claude.
 
 ## Setup (manual)
 
 ### 1. Clone, install, log in to Cloudflare
 
 ```sh
-git clone https://github.com/bm1549/lunchmoney-mcp-cloudflare.git
+git clone https://github.com/georgebashi/lunchmoney-mcp-cloudflare.git
 cd lunchmoney-mcp-cloudflare
 npm install
 npx wrangler login
 ```
 
-### 2. Create the KV namespaces
+### 2. Create the KV namespace
 
 ```sh
 npx wrangler kv namespace create OAUTH_KV
-npx wrangler kv namespace create USER_TOKENS
 ```
 
-Open `wrangler.jsonc` and paste the printed ids over `REPLACE_WITH_OAUTH_KV_ID` and `REPLACE_WITH_USER_TOKENS_ID` respectively.
+Paste the printed id into `wrangler.jsonc` over `REPLACE_WITH_OAUTH_KV_ID`.
 
-### 3. Deploy once to mint your URL
+### 3. Deploy
 
 ```sh
 npx wrangler deploy
 ```
 
-The output prints a URL like `https://lunchmoney-mcp.<your-subdomain>.workers.dev`. Copy it — you'll need it next.
+The output prints a URL like `https://lunchmoney-mcp.<your-subdomain>.workers.dev`.
 
-### 4. Set up Google sign-in
-
-At [Google Cloud → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials):
-
-1. Configure the **OAuth consent screen** → **External** + **Testing**. Add the Gmail addresses you want to allow as test users.
-2. Create credentials → **OAuth client ID** → **Web application**.
-3. Add an **Authorized redirect URI**:
-   ```
-   https://lunchmoney-mcp.<your-subdomain>.workers.dev/authorize/callback
-   ```
-4. Copy the **Client ID** and **Client Secret**.
-
-### 5. Set the worker secrets
+### 4. Store your LunchMoney token
 
 ```sh
-echo -n "<google-client-id>"      | npx wrangler secret put GOOGLE_CLIENT_ID
-echo -n "<google-client-secret>"  | npx wrangler secret put GOOGLE_CLIENT_SECRET
-echo -n "you@gmail.com"           | npx wrangler secret put ALLOWED_EMAILS
-openssl rand -hex 32              | npx wrangler secret put STATE_SECRET
+npx wrangler secret put LUNCHMONEY_API_TOKEN
 ```
 
-`ALLOWED_EMAILS` is **optional** and serves as a beta gate. Leave it unset (or set it to an empty string) to allow any Google account with a verified email. Set it to a comma-separated list to restrict access.
+Setting a secret redeploys the worker, so there's no second `deploy` step.
 
-### 6. Redeploy
-
-```sh
-npx wrangler deploy
-```
-
-### 7. Connect from Claude
+### 5. Connect from Claude
 
 In [claude.ai](https://claude.ai) → **Settings → Connectors → Add custom connector**:
 
@@ -90,31 +63,53 @@ In [claude.ai](https://claude.ai) → **Settings → Connectors → Add custom c
 https://lunchmoney-mcp.<your-subdomain>.workers.dev/mcp
 ```
 
-The first time you connect:
+Claude opens a sign-in page. Paste the same LunchMoney API token to approve the connection, and the LunchMoney tools show up in Claude. Approvals last until you revoke them; you won't be asked again on reconnect.
 
-1. You'll be bounced through Google sign-in.
-2. After sign-in you'll land on a `/setup` page asking for your LunchMoney API token.
-3. Paste a token from [my.lunchmoney.app/developers](https://my.lunchmoney.app/developers) and submit.
-4. You'll be returned to Claude with all LunchMoney tools registered.
+## How the auth works
 
-On subsequent connects you'll skip step 2 — the stored token is reused.
+Claude's custom-connector UI speaks OAuth, so the worker has to be an OAuth authorization server — that part isn't optional. What *is* optional is using an identity provider to run it, and this worker doesn't:
 
-## Token rotation (v1 limitation)
+- `POST /register` — Claude registers itself (RFC 7591 dynamic client registration). Open by necessity, rate-limited per IP, and the registration is rejected unless every `redirect_uri` is `https` (or `http` on loopback, for local dev clients).
+- `GET /authorize` — renders a single password field. It names the client asking and the URL the code would be sent to.
+- `POST /authorize` — compares your paste against `LUNCHMONEY_API_TOKEN` in constant time, rate-limited to 5 attempts per minute per IP. On a match, it issues the grant. Nothing is stored: no cookie, no session, no second copy of the token.
+- `/mcp` — the MCP endpoint, reachable only with an access token the worker issued.
 
-This release does not yet expose a self-serve UI for rotating or deleting a stored token. To rotate, the operator deletes the user's KV row:
+The token is checked against LunchMoney at approval time, but only a definitive `401`/`403` blocks the grant — an outage on LunchMoney's side must not lock you out of your own connector.
+
+`OAUTH_KV` holds client registrations and issued grants. Your LunchMoney token is never written to it.
+
+## Rotating the token
 
 ```sh
-# `sub` is the Google subject id printed in worker logs at sign-in time.
-npx wrangler kv key delete --binding USER_TOKENS "user:<sub>"
+npx wrangler secret put LUNCHMONEY_API_TOKEN
 ```
 
-The user will then be sent back through `/setup` on their next connect. A `/settings` page for self-serve rotation is a planned follow-up.
+Existing Claude grants keep working and immediately start using the new token. To also force Claude to re-approve, delete the grant keys from KV:
+
+```sh
+npx wrangler kv key list --binding OAUTH_KV
+npx wrangler kv key delete --binding OAUTH_KV "<grant key>"
+```
+
+## Local development
+
+```sh
+cp .dev.vars.example .dev.vars   # then fill in LUNCHMONEY_API_TOKEN
+npm run dev
+```
+
+```sh
+npm run typecheck
+npm run lint
+npm test
+```
 
 ## Troubleshooting
 
-- **Google warns "App is being tested"** — normal in Testing mode. Continue.
-- **`Forbidden: <email> is not authorized`** after Google sign-in — that address isn't in `ALLOWED_EMAILS`. Either add them to the allowlist or unset it for open signup.
-- **`Setup link expired`** at `/setup` — the resume token is good for 30 minutes. Re-launch the connect flow from Claude.
+- **"That doesn't match the API token this connector was deployed with"** — the paste differs from the stored secret. Re-run `npx wrangler secret put LUNCHMONEY_API_TOKEN` if you're unsure what's stored.
+- **"LunchMoney no longer accepts this token"** — the token was revoked or rotated at LunchMoney. Issue a new one and `wrangler secret put` it.
+- **"Too many attempts"** — the per-IP limiter. Wait a minute.
+- **"Unknown client"** — the registration expired (90 days). Remove and re-add the connector in Claude.
 - **Anything else** — `npx wrangler tail` streams live logs from the deployed worker.
 
 ## License
